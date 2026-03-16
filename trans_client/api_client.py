@@ -1,0 +1,649 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import json
+import logging
+import random
+import re
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Callable
+
+import httpx
+
+
+from .dtos import (    TransFreightExchangeRequest,
+    TransFreightExchangeResponse,
+)
+
+_RAW_PREVIEW_MAX_LEN = 1200
+_RAW_TEXT_REDACTION_SCAN_MAX = _RAW_PREVIEW_MAX_LEN * 4
+_VALIDATION_SUMMARY_LIMIT = 5
+
+logger = logging.getLogger("trans.api")
+_RATE_LIMITER_LOCK = threading.Lock()
+_SHARED_RATE_LIMITER: "_AsyncRateLimiter | None" = None
+_SHARED_RATE_LIMITER_RATE: int | None = None
+
+
+class _AsyncRateLimiter:
+    def __init__(self, rate_per_second: int):
+        effective_rate = max(rate_per_second, 1)
+        self._interval_seconds = 1.0 / effective_rate
+        self._lock = threading.Lock()
+        self._next_slot_at = 0.0
+
+    async def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            wait_seconds = max(0.0, self._next_slot_at - now)
+            reserved_slot = max(self._next_slot_at, now)
+            self._next_slot_at = reserved_slot + self._interval_seconds
+
+        if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds)
+
+
+async def _acquire_trans_api_slot(rate_limit: int) -> None:
+    global _SHARED_RATE_LIMITER
+    global _SHARED_RATE_LIMITER_RATE
+
+    configured_rate = max(rate_limit, 1)
+    if _SHARED_RATE_LIMITER is None or _SHARED_RATE_LIMITER_RATE != configured_rate:
+        with _RATE_LIMITER_LOCK:
+            if _SHARED_RATE_LIMITER is None or _SHARED_RATE_LIMITER_RATE != configured_rate:
+                _SHARED_RATE_LIMITER = _AsyncRateLimiter(configured_rate)
+                _SHARED_RATE_LIMITER_RATE = configured_rate
+
+    assert _SHARED_RATE_LIMITER is not None
+    await _SHARED_RATE_LIMITER.acquire()
+
+
+@dataclass(frozen=True)
+class TransNormalizedError:
+    status_code: int
+    detail: str | None
+    title: str | None
+    provider_response_id: str | None
+    validation_messages_flat: tuple[tuple[str, str], ...]
+    raw_preview: str | None
+    retry_after_seconds: float | None
+
+
+class TransApiError(Exception):
+    def __init__(self, normalized: TransNormalizedError):
+        self.normalized = normalized
+        super().__init__(_format_trans_error(normalized))
+
+
+class TransApiUnreachableError(Exception):
+    def __init__(self, message: str = "Trans API unreachable"):
+        super().__init__(message)
+
+
+def _log_interaction(
+    *,
+    method: str,
+    url: str,
+    request_body: dict | None,
+    resp: httpx.Response,
+    elapsed_ms: float,
+) -> None:
+    safe_body = _redact_json_value(request_body) if request_body else None
+
+    safe_response: Any = None
+    try:
+        response_body = resp.json()
+        safe_response = (
+            _redact_json_value(response_body)
+            if isinstance(response_body, (dict, list))
+            else response_body
+        )
+    except Exception:
+        raw_text = resp.text or ""
+        if raw_text:
+            safe_response = _truncate(
+                _redact_text(_compact_single_line(raw_text)),
+                max_len=_RAW_PREVIEW_MAX_LEN,
+            )
+
+    data = {
+        "method": method,
+        "url": url,
+        "request_body": safe_body,
+        "status_code": resp.status_code,
+        "response_headers": dict(resp.headers),
+        "response_body": safe_response,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+    log_message = "Trans API %s %s -> %s (%.0fms)"
+    if resp.status_code >= 400:
+        logger.error(
+            log_message,
+            method,
+            url,
+            resp.status_code,
+            elapsed_ms,
+            extra={"trans_interaction": data},
+        )
+        return
+
+    logger.info(
+        log_message,
+        method,
+        url,
+        resp.status_code,
+        elapsed_ms,
+        extra={"trans_interaction": data},
+    )
+
+
+def _classify_retry(
+    *, normalized_error: TransNormalizedError | None, request_error: bool
+) -> str | None:
+    if request_error:
+        return "network_error"
+
+    status_code = normalized_error.status_code if normalized_error is not None else None
+    if status_code == 429:
+        return "provider_status_429"
+    if status_code is not None and status_code >= 500:
+        return f"provider_status_{status_code}"
+    return None
+
+
+def _compute_retry_delay_seconds(
+    *, attempt: int, retry_after_seconds: float | None
+) -> tuple[float, str]:
+    if retry_after_seconds is not None:
+        return max(retry_after_seconds, 0.0), "retry_after"
+
+    base_seconds = max(settings.trans_api_backoff_base_ms, 1) / 1000
+    max_seconds = max(settings.trans_api_backoff_max_ms, settings.trans_api_backoff_base_ms) / 1000
+    capped_seconds = min(base_seconds * (2 ** max(attempt - 1, 0)), max_seconds)
+    jittered_seconds = random.uniform(capped_seconds / 2, capped_seconds)
+    return jittered_seconds, "exponential_jitter"
+
+
+class TransApiClient:
+    def __init__(
+        self,
+        *,
+        api_base_url: str,
+        api_key: str,
+        timeout_seconds: float = 30,
+        client: httpx.AsyncClient | None = None,
+    ):
+        self._api_base_url = api_base_url.rstrip("/")
+        self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
+        self._client = client
+
+    async def _sleep_before_retry(
+        self,
+        *,
+        attempt: int,
+        max_attempts: int,
+        retry_count: int,
+        retry_reason: str | None,
+        retry_after_seconds: float | None,
+        retry_observer: Callable[[TransRetryEvent], None] | None,
+        status_code: int | None,
+        error_message: str,
+    ) -> int | None:
+        if retry_reason is None or attempt >= max_attempts:
+            return None
+
+        delay_seconds, delay_source = _compute_retry_delay_seconds(
+            attempt=attempt,
+            retry_after_seconds=retry_after_seconds,
+        )
+        if retry_observer is not None:
+            retry_observer(
+                TransRetryEvent(
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    delay_seconds=delay_seconds,
+                    retry_reason=retry_reason,
+                    delay_source=delay_source,
+                    status_code=status_code,
+                    error_message=error_message,
+                )
+            )
+
+        await asyncio.sleep(delay_seconds)
+        return retry_count + 1
+
+    async def _send_request(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        request_body: dict | None,
+        expected_status_code: int,
+        retry_observer: Callable[[TransRetryEvent], None] | None = None,
+        json_body: dict | None = None,
+    ) -> tuple[httpx.Response, int]:
+        max_attempts = max(settings.trans_api_max_attempts, 1)
+        retry_count = 0
+
+        for attempt in range(1, max_attempts + 1):
+            t0 = time.monotonic()
+            try:
+                await _acquire_trans_api_slot()
+                resp = await client.request(
+                    method,
+                    url,
+                    json=json_body,
+                    headers=headers,
+                    timeout=self._timeout_seconds,
+                )
+            except httpx.RequestError as exc:
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                logger.error(
+                    "Trans API request failed",
+                    extra={
+                        "trans_interaction": {
+                            "method": method,
+                            "url": url,
+                            "request_body": _redact_json_value(request_body)
+                            if request_body
+                            else None,
+                            "elapsed_ms": round(elapsed_ms, 1),
+                            "error": str(exc),
+                        }
+                    },
+                )
+                next_retry_count = await self._sleep_before_retry(
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    retry_count=retry_count,
+                    retry_reason=_classify_retry(normalized_error=None, request_error=True),
+                    retry_after_seconds=None,
+                    retry_observer=retry_observer,
+                    status_code=None,
+                    error_message=str(exc),
+                )
+                if next_retry_count is None:
+                    raise TransApiUnreachableError() from exc
+                retry_count = next_retry_count
+                continue
+
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            _log_interaction(
+                method=method,
+                url=url,
+                request_body=request_body,
+                resp=resp,
+                elapsed_ms=elapsed_ms,
+            )
+
+            if resp.status_code == expected_status_code:
+                return resp, retry_count
+
+            normalized_error = _normalize_trans_error(resp)
+            next_retry_count = await self._sleep_before_retry(
+                attempt=attempt,
+                max_attempts=max_attempts,
+                retry_count=retry_count,
+                retry_reason=_classify_retry(
+                    normalized_error=normalized_error,
+                    request_error=False,
+                ),
+                retry_after_seconds=normalized_error.retry_after_seconds,
+                retry_observer=retry_observer,
+                status_code=normalized_error.status_code,
+                error_message=_format_trans_error(normalized_error),
+            )
+            if next_retry_count is None:
+                raise TransApiError(normalized_error, retry_count=retry_count)
+            retry_count = next_retry_count
+
+        raise RuntimeError("Trans API retry loop exited unexpectedly")
+
+    async def new_freight_to_freight_exchange(
+        self,
+        payload: TransFreightExchangeRequest,
+        *,
+        access_token: str,
+    ) -> TransFreightExchangeResponse:
+        url = f"{self._api_base_url}/ext/freights-api/v1/freight-exchange"
+        headers = {
+            "Content-type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "Api-key": self._api_key,
+        }
+        body = payload.model_dump(by_alias=True, exclude_none=True)
+        if self._client is not None:
+            resp, _retry_count = await self._send_request(
+                client=self._client,
+                method="POST",
+                url=url,
+                headers=headers,
+                request_body=body,
+                json_body=body,
+                expected_status_code=201,
+            )
+        else:
+            async with httpx.AsyncClient() as client:
+                resp, _retry_count = await self._send_request(
+                    client=client,
+                    method="POST",
+                    url=url,
+                    headers=headers,
+                    request_body=body,
+                    json_body=body,
+                    expected_status_code=201,
+                )
+
+        try:
+            parsed = resp.json()
+        except json.JSONDecodeError as exc:
+            raise Exception("Trans API invalid response") from exc
+        return TransFreightExchangeResponse.model_validate(parsed)
+
+    async def refresh_freight_publication(
+        self,
+        *,
+        freight_id: int,
+        access_token: str,
+        retry_observer: Callable[[TransRetryEvent], None] | None = None,
+    ) -> int:
+        """
+        Refresh freight publication.
+        """
+        url = f"{self._api_base_url}/ext/freights-api/v1/freights/{freight_id}/refresh_publication"
+        headers = {
+            "Content-type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "Api-key": self._api_key,
+        }
+        if self._client is not None:
+            _resp, retry_count = await self._send_request(
+                client=self._client,
+                method="PUT",
+                url=url,
+                headers=headers,
+                request_body=None,
+                expected_status_code=200,
+                retry_observer=retry_observer,
+            )
+        else:
+            async with httpx.AsyncClient() as client:
+                _resp, retry_count = await self._send_request(
+                    client=client,
+                    method="PUT",
+                    url=url,
+                    headers=headers,
+                    request_body=None,
+                    expected_status_code=200,
+                    retry_observer=retry_observer,
+                )
+        return retry_count
+
+    async def cancel_freight_publication(self, *, freight_id: int, access_token: str) -> int:
+        """
+        Cancel freight publication.
+        """
+        url = f"{self._api_base_url}/ext/freights-api/v1/cancelPublication/{freight_id}"
+        headers = {
+            "Content-type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "Api-key": self._api_key,
+        }
+        if self._client is not None:
+            _resp, retry_count = await self._send_request(
+                client=self._client,
+                method="POST",
+                url=url,
+                headers=headers,
+                request_body=None,
+                expected_status_code=201,
+            )
+        else:
+            async with httpx.AsyncClient() as client:
+                _resp, retry_count = await self._send_request(
+                    client=client,
+                    method="POST",
+                    url=url,
+                    headers=headers,
+                    request_body=None,
+                    expected_status_code=201,
+                )
+        return retry_count
+
+
+def _extract_trans_error(resp: httpx.Response) -> str:
+    return _format_trans_error(_normalize_trans_error(resp))
+
+
+def _normalize_trans_error(resp: httpx.Response) -> TransNormalizedError:
+    raw = resp.text or ""
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+
+    envelope, provider_response_id = _extract_envelope(payload)
+    validation_messages_flat = _flatten_validation_messages(
+        envelope.get("validation_messages") if isinstance(envelope, dict) else None
+    )
+
+    detail = _first_non_blank(
+        _as_non_blank_str(envelope.get("detail")) if isinstance(envelope, dict) else None,
+        _as_non_blank_str(envelope.get("message")) if isinstance(envelope, dict) else None,
+        _as_non_blank_str(envelope.get("error_description"))
+        if isinstance(envelope, dict)
+        else None,
+        _as_non_blank_str(envelope.get("error")) if isinstance(envelope, dict) else None,
+    )
+
+    title = _as_non_blank_str(envelope.get("title")) if isinstance(envelope, dict) else None
+    upstream_status = _coerce_int(envelope.get("status")) if isinstance(envelope, dict) else None
+    raw_preview = _build_raw_preview(raw=raw, payload=payload)
+    retry_after_seconds = _parse_retry_after(resp.headers.get("Retry-After"))
+
+    return TransNormalizedError(
+        status_code=upstream_status or resp.status_code,
+        detail=detail,
+        title=title,
+        provider_response_id=provider_response_id,
+        validation_messages_flat=validation_messages_flat,
+        raw_preview=raw_preview,
+        retry_after_seconds=retry_after_seconds,
+    )
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if not normalized:
+        return None
+
+    try:
+        parsed_seconds = float(normalized)
+    except ValueError:
+        parsed_seconds = None
+
+    if parsed_seconds is not None:
+        return max(parsed_seconds, 0.0)
+
+    try:
+        parsed_dt = parsedate_to_datetime(normalized)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+    if parsed_dt.tzinfo is None:
+        parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+    delta = (parsed_dt.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+    return max(delta, 0.0)
+
+
+def _extract_envelope(payload: Any) -> tuple[dict[str, Any], str | None]:
+    if not isinstance(payload, dict):
+        return {}, None
+
+    provider_response_id = _as_non_blank_str(payload.get("id"))
+    message = payload.get("message")
+    if isinstance(message, dict):
+        return message, provider_response_id
+    return payload, provider_response_id
+
+
+def _format_trans_error(normalized: TransNormalizedError) -> str:
+    base = f"Trans API error ({normalized.status_code})"
+    parts: list[str] = []
+
+    if normalized.detail:
+        parts.append(normalized.detail)
+    elif normalized.title:
+        parts.append(normalized.title)
+
+    if normalized.validation_messages_flat:
+        summary = "; ".join(
+            f"{key}: {value}"
+            for key, value in normalized.validation_messages_flat[:_VALIDATION_SUMMARY_LIMIT]
+        )
+        parts.append(summary)
+
+    if not parts and normalized.raw_preview:
+        parts.append(normalized.raw_preview)
+
+    if not parts:
+        return base
+    return f"{base}: {' | '.join(parts)}"
+
+
+def _flatten_validation_messages(value: Any) -> tuple[tuple[str, str], ...]:
+    flattened: list[tuple[str, str]] = []
+
+    def _visit(node: Any, *, path: str) -> None:
+        if isinstance(node, dict):
+            for key in sorted(node):
+                key_text = str(key).strip()
+                if not key_text:
+                    continue
+                next_path = f"{path}.{key_text}" if path else key_text
+                _visit(node[key], path=next_path)
+            return
+
+        if isinstance(node, list):
+            for idx, item in enumerate(node):
+                next_path = f"{path}[{idx}]" if path else f"[{idx}]"
+                _visit(item, path=next_path)
+            return
+
+        text = _as_non_blank_str(node)
+        if text and path:
+            flattened.append((path, text))
+
+    if isinstance(value, dict):
+        _visit(value, path="")
+    elif value is not None:
+        _visit(value, path="validation_messages")
+
+    return tuple(flattened)
+
+
+def _is_sensitive_key(key: str) -> bool:
+    normalized = key.strip().lower().replace("-", "_")
+    return (
+        "token" in normalized
+        or "authorization" in normalized
+        or normalized in {"api_key", "apikey"}
+    )
+
+
+def _redact_json_value(value: Any, *, parent_key: str | None = None) -> Any:
+    if parent_key and _is_sensitive_key(parent_key):
+        return "[REDACTED]"
+
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_json_value(item, parent_key=str(key)) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json_value(item, parent_key=parent_key) for item in value]
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
+
+
+def _redact_text(value: str) -> str:
+    redacted = value
+    redacted = re.sub(
+        r'(?i)("?(?:authorization|api[-_]?key|access[_-]?token|refresh[_-]?token|token)"?\s*:\s*")([^"]+)(")',
+        r"\1[REDACTED]\3",
+        redacted,
+    )
+    redacted = re.sub(r"(?i)\bbearer\s+\S+", "Bearer [REDACTED]", redacted)
+    redacted = re.sub(
+        r"(?i)\b(authorization|api[-_]?key|access[_-]?token|refresh[_-]?token|token)\s*[:=]\s*(?:bearer\s+)?\S+",
+        lambda match: f"{match.group(1)}=[REDACTED]",
+        redacted,
+    )
+    return redacted
+
+
+def _truncate(value: str, *, max_len: int) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[:max_len]
+
+
+def _compact_single_line(value: str) -> str:
+    # Keep raw previews log-friendly and bounded to one line.
+    return " ".join(value.split())
+
+
+def _build_raw_preview(*, raw: str, payload: Any) -> str | None:
+    candidate = ""
+    if isinstance(payload, (dict, list)):
+        candidate = json.dumps(
+            _redact_json_value(payload),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    else:
+        bounded_raw = _truncate(raw, max_len=_RAW_TEXT_REDACTION_SCAN_MAX).strip()
+        compact_raw = _compact_single_line(bounded_raw)
+        candidate = _redact_text(compact_raw)
+
+    if not candidate:
+        return None
+    return _truncate(candidate, max_len=_RAW_PREVIEW_MAX_LEN)
+
+
+def _coerce_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_non_blank_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _first_non_blank(*values: str | None) -> str | None:
+    for value in values:
+        if value:
+            return value
+    return None
