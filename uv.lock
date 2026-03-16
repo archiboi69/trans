@@ -339,7 +339,7 @@ wheels = [
 ]
 
 [[package]]
-name = "trans-client"
+name = "trans"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
