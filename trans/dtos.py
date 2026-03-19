@@ -404,3 +404,11 @@ class TransFreightExchangeResponse(TransBaseModel):
     surcharges: list[dict] | dict | None = None
     volume: float | None = None
     width: float | None = None
+
+
+class TransBulkCancelledFreight(TransBaseModel):
+    id: int | None = None
+
+
+class TransBulkCancelPublicationResponse(TransBaseModel):
+    freights_publications: list[TransBulkCancelledFreight] = Field(default_factory=list)

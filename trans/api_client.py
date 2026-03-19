@@ -16,6 +16,7 @@ import httpx
 
 
 from .dtos import (    TransFreightExchangeRequest,
+    TransBulkCancelPublicationResponse,
     TransFreightExchangeResponse,
 )
 from .config import TransSdkConfig
@@ -163,6 +164,29 @@ class TransApiClient:
             path=path,
             headers=headers,
         )
+
+    async def bulk_cancel_freight_publications(
+        self, *, freight_ids: list[int], access_token: str
+    ) -> TransBulkCancelPublicationResponse:
+        path = "ext/freights-api/v1/cancelPublication"
+        headers = {
+            "Content-type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "Api-key": self._config.api_key,
+        }
+        resp = await self._execute_request(
+            method="POST",
+            path=path,
+            headers=headers,
+            request_body=freight_ids,
+        )
+
+        try:
+            parsed = resp.json()
+        except json.JSONDecodeError as exc:
+            raise TransInvalidResponseError("Trans API invalid JSON response") from exc
+        return TransBulkCancelPublicationResponse.model_validate(parsed)
 
 
 

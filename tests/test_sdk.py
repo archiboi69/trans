@@ -4,6 +4,7 @@ import json
 from trans import (
     TransApiClient, 
     TransAuthClient, 
+    TransBulkCancelPublicationResponse,
     TransSdkConfig, 
     TransApiError, 
     TransAuthRejectedError,
@@ -176,3 +177,29 @@ async def test_api_client_refresh_cancel(config):
         # Should not raise
         await api_client.refresh_freight_publication(freight_id=123, access_token="token")
         await api_client.cancel_freight_publication(freight_id=123, access_token="token")
+
+
+@pytest.mark.asyncio
+async def test_api_client_bulk_cancel_success(config):
+    def handler(request):
+        assert request.method == "POST"
+        assert request.url.path.endswith("/ext/freights-api/v1/cancelPublication")
+        assert json.loads(request.content) == [856796, 234578]
+        return httpx.Response(
+            200,
+            json={
+                "freights_publications": [
+                    {"id": 856796},
+                    {"id": 234578},
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        api_client = TransApiClient(config=config, client=client)
+        response = await api_client.bulk_cancel_freight_publications(
+            freight_ids=[856796, 234578],
+            access_token="token",
+        )
+        assert isinstance(response, TransBulkCancelPublicationResponse)
+        assert [item.id for item in response.freights_publications] == [856796, 234578]
