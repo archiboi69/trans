@@ -108,6 +108,82 @@ class TransMonitoringEnum(str, Enum):
     REQUIRED = "required"
 
 
+class TransOtherRequirement(str, Enum):
+    A_SIGN = "a-sign"
+    ABP_CAT_1_PERMIT = "abp_cat_1_permit"
+    ABP_CAT_2_PERMIT = "abp_cat_2_permit"
+    ABP_CAT_3_PERMIT = "abp_cat_3_permit"
+    ADR = "adr"
+    AUTORISATION_ECMT_CEMT_LICENCE = "autorisation_ecmt_cemt_licence"
+    BACKUP_GENERATOR_FOR_REEFER = "backup_generator_for_reefer"
+    CARNET_ATA = "carnet_ata"
+    CARNET_TIR = "carnet_tir"
+    CLEANING_CERTIFICATE = "cleaning_certificate"
+    CORNER_PROTECTOR = "corner_protector"
+    CUSTOM_ROPE = "custom_rope"
+    DOUBLE_CAST = "double_cast"
+    DOPPEL_DECKER = "doppel_decker"
+    GMP_CERTIFICATE = "gmp_certificate"
+    GOODS_TO_DECLARE = "goods_to_declare"
+    GPS = "gps"
+    HDS = "hds"
+    LIFT = "lift"
+    LOAD_SECURING_POLES = "load_securing_poles"
+    MULTI_TEMPERATURE = "multi_temperature"
+    NON_SLIP_MATS = "non-slip_mats"
+    PALLET_BASKET = "pallet_basket"
+    QUALIMAT_CERTIFICATE = "qualimat_certificate"
+    RAMP_HEIGHT = "ramp_height"
+    SAFETY_BAR = "safety_bar"
+    TEMPERATURE_LOG = "temperature_log"
+    THERMOMETER = "thermometer"
+    TRANSPORT_LINES = "transport_lines"
+    WASTE_TRANSPORT_ITALY_LICENCE = "waste_transport_italy_licence"
+    XL_CERTIFICATE = "xl_certificate"
+
+
+class TransRequiredAdrClass(str, Enum):
+    ADR_1 = "adr_1"
+    ADR_1_1 = "adr_1_1"
+    ADR_1_2 = "adr_1_2"
+    ADR_1_3 = "adr_1_3"
+    ADR_1_4 = "adr_1_4"
+    ADR_1_5 = "adr_1_5"
+    ADR_1_6 = "adr_1_6"
+    ADR_2 = "adr_2"
+    ADR_2_1 = "adr_2_1"
+    ADR_2_2 = "adr_2_2"
+    ADR_2_3 = "adr_2_3"
+    ADR_3 = "adr_3"
+    ADR_4_1 = "adr_4_1"
+    ADR_4_2 = "adr_4_2"
+    ADR_4_3 = "adr_4_3"
+    ADR_5_1 = "adr_5_1"
+    ADR_5_2 = "adr_5_2"
+    ADR_6_1 = "adr_6_1"
+    ADR_6_2 = "adr_6_2"
+    ADR_7 = "adr_7"
+    ADR_8 = "adr_8"
+    ADR_9 = "adr_9"
+
+
+class TransRequiredWayOfLoading(str, Enum):
+    BACK = "back"
+    SIDE = "side"
+    TOP = "top"
+
+
+class TransRequiredDoorType(str, Enum):
+    TAILGATE = "tailgate"
+    DOOR = "door"
+
+
+class TransRequiredTipperTrailerAdditionalEquipment(str, Enum):
+    SINGLE_GRAIN_HATCH = "single_grain_hatch"
+    DOUBLE_GRAIN_HATCH = "double_grain_hatch"
+    DUST_SOCK = "dust_sock"
+
+
 class TransOperationType(str, Enum):
     LOADING = "loading"
     UNLOADING = "unloading"
@@ -119,6 +195,22 @@ class TransTransportTypeEnum(str, Enum):
     MULTI_FTL = "multi_ftl"
 
 
+class TransTransportScheduleType(str, Enum):
+    SHIPPER = "shipper"
+    CARRIER = "carrier"
+    TOGETHER = "together"
+
+
+class TransTransportSettlement(str, Enum):
+    ROUTE = "route"
+    TON = "ton"
+
+
+class TransTransportSettlementBasis(str, Enum):
+    LOADING = "loading"
+    UNLOADING = "unloading"
+
+
 class TransPaymentPeriodEnum(str, Enum):
     DEFERRED = "deferred"
     PAYMENT_IN_ADVANCE = "payment_in_advance"
@@ -128,9 +220,9 @@ class TransPaymentPeriodEnum(str, Enum):
 class TransTransport(TransBaseModel):
     type: TransTransportTypeEnum | None = None
     count: float | None = None
-    schedule_type: str | None = None
-    settlement: str | None = None
-    settlement_basis: str | None = None
+    schedule_type: TransTransportScheduleType | None = None
+    settlement: TransTransportSettlement | None = None
+    settlement_basis: TransTransportSettlementBasis | None = None
     total_weight: float | None = None
     units_per_transport: float | None = None
 
@@ -147,9 +239,13 @@ class TransRequirements(TransBaseModel):
     vehicle_size: TransVehicleSizeEnum | None = None
     is_ftl: bool
     required_truck_bodies: list[TransVehicleBodyEnum]
-    other_requirements: list[str] | None = None
-    required_adr_classes: list[str] | None = None
-    required_ways_of_loading: list[str] | None = None
+    other_requirements: list[TransOtherRequirement] | None = None
+    required_adr_classes: list[TransRequiredAdrClass] | None = None
+    required_ways_of_loading: list[TransRequiredWayOfLoading] | None = None
+    required_door_types: list[TransRequiredDoorType] | None = None
+    required_tipper_trailer_additional_equipment: (
+        list[TransRequiredTipperTrailerAdditionalEquipment] | None
+    ) = None
     # Intentionally misspelled to match the Trans payload key.
     monitorig: TransMonitoringEnum | None = None
     temperature: TransTemperature | None = None
@@ -270,12 +366,14 @@ class TransResponseRequirements(TransBaseModel):
     exemption_from_adr: bool | None = None
     is_ftl: bool | None = None
     monitoring: TransMonitoringEnum | None = None
-    other_requirements: list[str] | None = None
-    required_adr_classes: list[str] | None = None
-    required_door_types: list[str] | None = None
-    required_tipper_trailer_additional_equipment: list[str] | None = None
+    other_requirements: list[TransOtherRequirement] | None = None
+    required_adr_classes: list[TransRequiredAdrClass] | None = None
+    required_door_types: list[TransRequiredDoorType] | None = None
+    required_tipper_trailer_additional_equipment: (
+        list[TransRequiredTipperTrailerAdditionalEquipment] | None
+    ) = None
     required_truck_bodies: list[TransVehicleBodyEnum] | None = None
-    required_ways_of_loading: list[str] | None = None
+    required_ways_of_loading: list[TransRequiredWayOfLoading] | None = None
     shipping_remarks: str | None = None
     temperature: TransTemperature | None = None
     transport: TransTransport | None = None

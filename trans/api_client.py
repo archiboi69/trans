@@ -26,42 +26,6 @@ _RAW_TEXT_REDACTION_SCAN_MAX = _RAW_PREVIEW_MAX_LEN * 4
 _VALIDATION_SUMMARY_LIMIT = 5
 
 logger = logging.getLogger("trans.api")
-_RATE_LIMITER_LOCK = threading.Lock()
-_SHARED_RATE_LIMITER: "_AsyncRateLimiter | None" = None
-_SHARED_RATE_LIMITER_RATE: int | None = None
-
-
-class _AsyncRateLimiter:
-    def __init__(self, rate_per_second: int):
-        effective_rate = max(rate_per_second, 1)
-        self._interval_seconds = 1.0 / effective_rate
-        self._lock = threading.Lock()
-        self._next_slot_at = 0.0
-
-    async def acquire(self) -> None:
-        with self._lock:
-            now = time.monotonic()
-            wait_seconds = max(0.0, self._next_slot_at - now)
-            reserved_slot = max(self._next_slot_at, now)
-            self._next_slot_at = reserved_slot + self._interval_seconds
-
-        if wait_seconds > 0:
-            await asyncio.sleep(wait_seconds)
-
-
-async def _acquire_trans_api_slot(rate_limit: int) -> None:
-    global _SHARED_RATE_LIMITER
-    global _SHARED_RATE_LIMITER_RATE
-
-    configured_rate = max(rate_limit, 1)
-    if _SHARED_RATE_LIMITER is None or _SHARED_RATE_LIMITER_RATE != configured_rate:
-        with _RATE_LIMITER_LOCK:
-            if _SHARED_RATE_LIMITER is None or _SHARED_RATE_LIMITER_RATE != configured_rate:
-                _SHARED_RATE_LIMITER = _AsyncRateLimiter(configured_rate)
-                _SHARED_RATE_LIMITER_RATE = configured_rate
-
-    assert _SHARED_RATE_LIMITER is not None
-    await _SHARED_RATE_LIMITER.acquire()
 
 
 @dataclass(frozen=True)
@@ -73,64 +37,6 @@ class TransNormalizedError:
     validation_messages_flat: tuple[tuple[str, str], ...]
     raw_preview: str | None
     retry_after_seconds: float | None
-
-
-def _log_interaction(
-    *,
-    method: str,
-    url: str,
-    request_body: dict | None,
-    resp: httpx.Response,
-    elapsed_ms: float,
-) -> None:
-    safe_body = _redact_json_value(request_body) if request_body else None
-
-    safe_response: Any = None
-    try:
-        response_body = resp.json()
-        safe_response = (
-            _redact_json_value(response_body)
-            if isinstance(response_body, (dict, list))
-            else response_body
-        )
-    except Exception:
-        raw_text = resp.text or ""
-        if raw_text:
-            safe_response = _truncate(
-                _redact_text(_compact_single_line(raw_text)),
-                max_len=_RAW_PREVIEW_MAX_LEN,
-            )
-
-    data = {
-        "method": method,
-        "url": url,
-        "request_body": safe_body,
-        "status_code": resp.status_code,
-        "response_headers": dict(resp.headers),
-        "response_body": safe_response,
-        "elapsed_ms": round(elapsed_ms, 1),
-    }
-
-    log_message = "Trans API %s %s -> %s (%.0fms)"
-    if resp.status_code >= 400:
-        logger.error(
-            log_message,
-            method,
-            url,
-            resp.status_code,
-            elapsed_ms,
-            extra={"trans_interaction": data},
-        )
-        return
-
-    logger.info(
-        log_message,
-        method,
-        url,
-        resp.status_code,
-        elapsed_ms,
-        extra={"trans_interaction": data},
-    )
 
 
 class TransApiClient:
@@ -162,7 +68,7 @@ class TransApiClient:
     ) -> httpx.Response:
         url = f"{self._config.api_base_url.rstrip('/')}/{path.lstrip('/')}"
         
-        await _acquire_trans_api_slot(self._config.rate_limit_per_second)
+        
 
         start_time = time.monotonic()
         try:
@@ -257,6 +163,66 @@ class TransApiClient:
             path=path,
             headers=headers,
         )
+
+
+
+
+def _log_interaction(
+    *,
+    method: str,
+    url: str,
+    request_body: dict | None,
+    resp: httpx.Response,
+    elapsed_ms: float,
+) -> None:
+    safe_body = _redact_json_value(request_body) if request_body else None
+
+    safe_response: Any = None
+    try:
+        response_body = resp.json()
+        safe_response = (
+            _redact_json_value(response_body)
+            if isinstance(response_body, (dict, list))
+            else response_body
+        )
+    except Exception:
+        raw_text = resp.text or ""
+        if raw_text:
+            safe_response = _truncate(
+                _redact_text(_compact_single_line(raw_text)),
+                max_len=_RAW_PREVIEW_MAX_LEN,
+            )
+
+    data = {
+        "method": method,
+        "url": url,
+        "request_body": safe_body,
+        "status_code": resp.status_code,
+        "response_headers": dict(resp.headers),
+        "response_body": safe_response,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+    log_message = "Trans API %s %s -> %s (%.0fms)"
+    if resp.status_code >= 400:
+        logger.error(
+            log_message,
+            method,
+            url,
+            resp.status_code,
+            elapsed_ms,
+            extra={"trans_interaction": data},
+        )
+        return
+
+    logger.info(
+        log_message,
+        method,
+        url,
+        resp.status_code,
+        elapsed_ms,
+        extra={"trans_interaction": data},
+    )
 
 
 def _extract_trans_error(resp: httpx.Response) -> str:

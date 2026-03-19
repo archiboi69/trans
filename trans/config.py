@@ -9,4 +9,3 @@ class TransSdkConfig(BaseModel):
     client_id: str
     client_secret: str
     timeout_seconds: float = Field(default=30.0)
-    rate_limit_per_second: int = Field(default=5)
