@@ -18,6 +18,8 @@ import httpx
 from .dtos import (    TransFreightExchangeRequest,
     TransFreightExchangeResponse,
 )
+from .config import TransSdkConfig
+from .exceptions import TransApiError, TransApiUnreachableError, TransInvalidResponseError
 
 _RAW_PREVIEW_MAX_LEN = 1200
 _RAW_TEXT_REDACTION_SCAN_MAX = _RAW_PREVIEW_MAX_LEN * 4
@@ -71,17 +73,6 @@ class TransNormalizedError:
     validation_messages_flat: tuple[tuple[str, str], ...]
     raw_preview: str | None
     retry_after_seconds: float | None
-
-
-class TransApiError(Exception):
-    def __init__(self, normalized: TransNormalizedError):
-        self.normalized = normalized
-        super().__init__(_format_trans_error(normalized))
-
-
-class TransApiUnreachableError(Exception):
-    def __init__(self, message: str = "Trans API unreachable"):
-        super().__init__(message)
 
 
 def _log_interaction(
@@ -142,140 +133,48 @@ def _log_interaction(
     )
 
 
-def _classify_retry(
-    *, normalized_error: TransNormalizedError | None, request_error: bool
-) -> str | None:
-    if request_error:
-        return "network_error"
-
-    status_code = normalized_error.status_code if normalized_error is not None else None
-    if status_code == 429:
-        return "provider_status_429"
-    if status_code is not None and status_code >= 500:
-        return f"provider_status_{status_code}"
-    return None
-
-
-def _compute_retry_delay_seconds(
-    *, attempt: int, retry_after_seconds: float | None
-) -> tuple[float, str]:
-    if retry_after_seconds is not None:
-        return max(retry_after_seconds, 0.0), "retry_after"
-
-    base_seconds = max(settings.trans_api_backoff_base_ms, 1) / 1000
-    max_seconds = max(settings.trans_api_backoff_max_ms, settings.trans_api_backoff_base_ms) / 1000
-    capped_seconds = min(base_seconds * (2 ** max(attempt - 1, 0)), max_seconds)
-    jittered_seconds = random.uniform(capped_seconds / 2, capped_seconds)
-    return jittered_seconds, "exponential_jitter"
-
-
 class TransApiClient:
     def __init__(
         self,
-        *,
-        api_base_url: str,
-        api_key: str,
-        timeout_seconds: float = 30,
+        config: TransSdkConfig,
         client: httpx.AsyncClient | None = None,
     ):
-        self._api_base_url = api_base_url.rstrip("/")
-        self._api_key = api_key
-        self._timeout_seconds = timeout_seconds
-        self._client = client
+        self._config = config
+        if client:
+            self._client = client
+            self._owns_client = False
+        else:
+            self._client = httpx.AsyncClient()
+            self._owns_client = True
 
-    async def _sleep_before_retry(
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def _execute_request(
         self,
-        *,
-        attempt: int,
-        max_attempts: int,
-        retry_count: int,
-        retry_reason: str | None,
-        retry_after_seconds: float | None,
-        retry_observer: Callable[[TransRetryEvent], None] | None,
-        status_code: int | None,
-        error_message: str,
-    ) -> int | None:
-        if retry_reason is None or attempt >= max_attempts:
-            return None
-
-        delay_seconds, delay_source = _compute_retry_delay_seconds(
-            attempt=attempt,
-            retry_after_seconds=retry_after_seconds,
-        )
-        if retry_observer is not None:
-            retry_observer(
-                TransRetryEvent(
-                    attempt=attempt,
-                    max_attempts=max_attempts,
-                    delay_seconds=delay_seconds,
-                    retry_reason=retry_reason,
-                    delay_source=delay_source,
-                    status_code=status_code,
-                    error_message=error_message,
-                )
-            )
-
-        await asyncio.sleep(delay_seconds)
-        return retry_count + 1
-
-    async def _send_request(
-        self,
-        *,
-        client: httpx.AsyncClient,
         method: str,
-        url: str,
-        headers: dict[str, str],
-        request_body: dict | None,
-        expected_status_code: int,
-        retry_observer: Callable[[TransRetryEvent], None] | None = None,
-        json_body: dict | None = None,
-    ) -> tuple[httpx.Response, int]:
-        max_attempts = max(settings.trans_api_max_attempts, 1)
-        retry_count = 0
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        request_body: dict | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        url = f"{self._config.api_base_url.rstrip('/')}/{path.lstrip('/')}"
+        
+        await _acquire_trans_api_slot(self._config.rate_limit_per_second)
 
-        for attempt in range(1, max_attempts + 1):
-            t0 = time.monotonic()
-            try:
-                await _acquire_trans_api_slot()
-                resp = await client.request(
-                    method,
-                    url,
-                    json=json_body,
-                    headers=headers,
-                    timeout=self._timeout_seconds,
-                )
-            except httpx.RequestError as exc:
-                elapsed_ms = (time.monotonic() - t0) * 1000
-                logger.error(
-                    "Trans API request failed",
-                    extra={
-                        "trans_interaction": {
-                            "method": method,
-                            "url": url,
-                            "request_body": _redact_json_value(request_body)
-                            if request_body
-                            else None,
-                            "elapsed_ms": round(elapsed_ms, 1),
-                            "error": str(exc),
-                        }
-                    },
-                )
-                next_retry_count = await self._sleep_before_retry(
-                    attempt=attempt,
-                    max_attempts=max_attempts,
-                    retry_count=retry_count,
-                    retry_reason=_classify_retry(normalized_error=None, request_error=True),
-                    retry_after_seconds=None,
-                    retry_observer=retry_observer,
-                    status_code=None,
-                    error_message=str(exc),
-                )
-                if next_retry_count is None:
-                    raise TransApiUnreachableError() from exc
-                retry_count = next_retry_count
-                continue
-
-            elapsed_ms = (time.monotonic() - t0) * 1000
+        start_time = time.monotonic()
+        try:
+            resp = await self._client.request(
+                method,
+                url,
+                json=request_body,
+                headers=headers,
+                timeout=timeout or self._config.timeout_seconds,
+            )
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            
             _log_interaction(
                 method=method,
                 url=url,
@@ -283,29 +182,15 @@ class TransApiClient:
                 resp=resp,
                 elapsed_ms=elapsed_ms,
             )
-
-            if resp.status_code == expected_status_code:
-                return resp, retry_count
-
-            normalized_error = _normalize_trans_error(resp)
-            next_retry_count = await self._sleep_before_retry(
-                attempt=attempt,
-                max_attempts=max_attempts,
-                retry_count=retry_count,
-                retry_reason=_classify_retry(
-                    normalized_error=normalized_error,
-                    request_error=False,
-                ),
-                retry_after_seconds=normalized_error.retry_after_seconds,
-                retry_observer=retry_observer,
-                status_code=normalized_error.status_code,
-                error_message=_format_trans_error(normalized_error),
-            )
-            if next_retry_count is None:
-                raise TransApiError(normalized_error, retry_count=retry_count)
-            retry_count = next_retry_count
-
-        raise RuntimeError("Trans API retry loop exited unexpectedly")
+            
+            if resp.status_code >= 400:
+                normalized = _normalize_trans_error(resp)
+                raise TransApiError(normalized)
+                
+            return resp
+            
+        except httpx.RequestError as exc:
+            raise TransApiUnreachableError(str(exc)) from exc
 
     async def new_freight_to_freight_exchange(
         self,
@@ -313,40 +198,25 @@ class TransApiClient:
         *,
         access_token: str,
     ) -> TransFreightExchangeResponse:
-        url = f"{self._api_base_url}/ext/freights-api/v1/freight-exchange"
+        path = "ext/freights-api/v1/freight-exchange"
         headers = {
             "Content-type": "application/json",
             "Accept": "application/json",
             "Authorization": f"Bearer {access_token}",
-            "Api-key": self._api_key,
+            "Api-key": self._config.api_key,
         }
         body = payload.model_dump(by_alias=True, exclude_none=True)
-        if self._client is not None:
-            resp, _retry_count = await self._send_request(
-                client=self._client,
-                method="POST",
-                url=url,
-                headers=headers,
-                request_body=body,
-                json_body=body,
-                expected_status_code=201,
-            )
-        else:
-            async with httpx.AsyncClient() as client:
-                resp, _retry_count = await self._send_request(
-                    client=client,
-                    method="POST",
-                    url=url,
-                    headers=headers,
-                    request_body=body,
-                    json_body=body,
-                    expected_status_code=201,
-                )
+        resp = await self._execute_request(
+            method="POST",
+            path=path,
+            headers=headers,
+            request_body=body,
+        )
 
         try:
             parsed = resp.json()
         except json.JSONDecodeError as exc:
-            raise Exception("Trans API invalid response") from exc
+            raise TransInvalidResponseError("Trans API invalid JSON response") from exc
         return TransFreightExchangeResponse.model_validate(parsed)
 
     async def refresh_freight_publication(
@@ -354,72 +224,39 @@ class TransApiClient:
         *,
         freight_id: int,
         access_token: str,
-        retry_observer: Callable[[TransRetryEvent], None] | None = None,
-    ) -> int:
+    ) -> None:
         """
         Refresh freight publication.
         """
-        url = f"{self._api_base_url}/ext/freights-api/v1/freights/{freight_id}/refresh_publication"
+        path = f"ext/freights-api/v1/freights/{freight_id}/refresh_publication"
         headers = {
             "Content-type": "application/json",
             "Accept": "application/json",
             "Authorization": f"Bearer {access_token}",
-            "Api-key": self._api_key,
+            "Api-key": self._config.api_key,
         }
-        if self._client is not None:
-            _resp, retry_count = await self._send_request(
-                client=self._client,
-                method="PUT",
-                url=url,
-                headers=headers,
-                request_body=None,
-                expected_status_code=200,
-                retry_observer=retry_observer,
-            )
-        else:
-            async with httpx.AsyncClient() as client:
-                _resp, retry_count = await self._send_request(
-                    client=client,
-                    method="PUT",
-                    url=url,
-                    headers=headers,
-                    request_body=None,
-                    expected_status_code=200,
-                    retry_observer=retry_observer,
-                )
-        return retry_count
+        await self._execute_request(
+            method="PUT",
+            path=path,
+            headers=headers,
+        )
 
-    async def cancel_freight_publication(self, *, freight_id: int, access_token: str) -> int:
+    async def cancel_freight_publication(self, *, freight_id: int, access_token: str) -> None:
         """
         Cancel freight publication.
         """
-        url = f"{self._api_base_url}/ext/freights-api/v1/cancelPublication/{freight_id}"
+        path = f"ext/freights-api/v1/cancelPublication/{freight_id}"
         headers = {
             "Content-type": "application/json",
             "Accept": "application/json",
             "Authorization": f"Bearer {access_token}",
-            "Api-key": self._api_key,
+            "Api-key": self._config.api_key,
         }
-        if self._client is not None:
-            _resp, retry_count = await self._send_request(
-                client=self._client,
-                method="POST",
-                url=url,
-                headers=headers,
-                request_body=None,
-                expected_status_code=201,
-            )
-        else:
-            async with httpx.AsyncClient() as client:
-                _resp, retry_count = await self._send_request(
-                    client=client,
-                    method="POST",
-                    url=url,
-                    headers=headers,
-                    request_body=None,
-                    expected_status_code=201,
-                )
-        return retry_count
+        await self._execute_request(
+            method="POST",
+            path=path,
+            headers=headers,
+        )
 
 
 def _extract_trans_error(resp: httpx.Response) -> str:

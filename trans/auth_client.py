@@ -12,6 +12,8 @@ import httpx
 from pydantic import SecretStr
 
 from .dtos import TransErrorResponse, TransTokenResponse
+from .config import TransSdkConfig
+from .exceptions import TransAuthError, TransAuthRejectedError, TransApiUnreachableError, TransInvalidResponseError
 
 logger = logging.getLogger("trans.auth")
 _RAW_PREVIEW_MAX_LEN = 1200
@@ -32,18 +34,10 @@ def _redact_token_like_text(value: str) -> str:
 class TransAuthClient:
     def __init__(
         self,
-        api_base_url: str,
-        auth_base_url: str,
-        api_key: str,
-        client_id: str,
-        client_secret: SecretStr,
+        config: TransSdkConfig,
         client: httpx.AsyncClient | None = None,
     ):
-        self._api_base_url = api_base_url.rstrip("/")
-        self._auth_base_url = auth_base_url.rstrip("/")
-        self._api_key = api_key
-        self._client_id = client_id
-        self._client_secret = client_secret
+        self._config = config
         self._client = client
         self._access_token: str | None = None
         self._expires_at: datetime | None = None
@@ -67,22 +61,20 @@ class TransAuthClient:
         if self._refresh_token:
             token = await self._refresh_access_token(self._refresh_token)
         else:
-            raise Exception(
-                "Trans access token missing. Complete OAuth authorization first."
-            )
+            raise TransAuthError("Trans access token missing. Complete OAuth authorization first.")
 
         self._store_token(token)
         return self._access_token or ""
 
     def build_auth_url(self, redirect_uri: str, state: str | None = None) -> str:
         query = {
-            "client_id": self._client_id,
+            "client_id": self._config.client_id,
             "response_type": "code",
             "redirect_uri": redirect_uri,
         }
         if state:
             query["state"] = state
-        return f"{self._auth_base_url}/oauth2/auth?{urlencode(query)}"
+        return f"{self._config.auth_base_url.rstrip('/')}/oauth2/auth?{urlencode(query)}"
 
     async def exchange_code_for_token(self, code: str, redirect_uri: str) -> TransTokenResponse:
         token = await self._request_token(code=code, redirect_uri=redirect_uri)
@@ -93,7 +85,7 @@ class TransAuthClient:
         token = await self.get_access_token()
         return {
             "Authorization": f"Bearer {token}",
-            "Api-key": self._api_key,
+            "Api-key": self._config.api_key,
         }
 
     async def _request_token(self, code: str, redirect_uri: str) -> TransTokenResponse:
@@ -101,8 +93,8 @@ class TransAuthClient:
             "grant_type": "authorization_code",
             "code": code,
             "redirect_uri": redirect_uri,
-            "client_id": self._client_id,
-            "client_secret": self._client_secret.get_secret_value(),
+            "client_id": self._config.client_id,
+            "client_secret": self._config.client_secret,
         }
         return await self._post_token(payload)
 
@@ -110,18 +102,18 @@ class TransAuthClient:
         payload = {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
-            "client_id": self._client_id,
-            "client_secret": self._client_secret.get_secret_value(),
+            "client_id": self._config.client_id,
+            "client_secret": self._config.client_secret,
         }
         return await self._post_token(payload)
 
     async def _post_token(self, payload: dict[str, str]) -> TransTokenResponse:
         # OAuth authorize UI lives on auth host, but token exchange is served
         # under the API host `/ext/auth-api/accounts/token`.
-        url = f"{self._api_base_url}/ext/auth-api/accounts/token"
+        url = f"{self._config.api_base_url.rstrip('/')}/ext/auth-api/accounts/token"
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "Api-key": self._api_key,
+            "Api-key": self._config.api_key,
         }
         safe_payload = {
             key: ("[REDACTED]" if key in {"client_secret", "refresh_token", "code"} else value)
@@ -149,7 +141,7 @@ class TransAuthClient:
                     }
                 },
             )
-            raise Exception("Trans API unreachable") from exc
+            raise TransApiUnreachableError("Trans API unreachable") from exc
 
         raw = resp.text
         elapsed_ms = (time.monotonic() - t0) * 1000
@@ -198,7 +190,7 @@ class TransAuthClient:
         if resp.status_code >= 400:
             detail = self._error_detail(raw) or f"Trans API error ({resp.status_code})"
             if resp.status_code == 401:
-                raise Exception(detail)
+                raise TransAuthRejectedError(detail)
 
             try:
                 payload = json.loads(raw) if raw else {}
@@ -206,14 +198,14 @@ class TransAuthClient:
                 payload = {}
 
             if payload.get("error") == "invalid_grant":
-                raise Exception(detail)
+                raise TransAuthRejectedError(detail)
 
-            raise Exception(detail)
+            raise TransAuthRejectedError(detail)
 
         try:
             parsed = resp.json()
         except json.JSONDecodeError as exc:
-            raise Exception("Trans API invalid response") from exc
+            raise TransInvalidResponseError("Trans API invalid response") from exc
 
         return TransTokenResponse.model_validate(parsed)
 
