@@ -9,6 +9,7 @@ from .exceptions import (
 )
 from .auth_client import TransAuthClient
 from .api_client import TransApiClient
+from .observability import bind_observability_context, current_observability_context
 from .dtos import (
     TransBulkCancelPublicationResponse,
     TransBulkCancelledFreight,
@@ -27,6 +28,8 @@ __all__ = [
     "TransInvalidResponseError",
     "TransAuthClient",
     "TransApiClient",
+    "bind_observability_context",
+    "current_observability_context",
     "TransBulkCancelPublicationResponse",
     "TransBulkCancelledFreight",
     "TransFreightExchangeRequest",

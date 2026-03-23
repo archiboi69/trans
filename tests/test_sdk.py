@@ -1,16 +1,19 @@
-import pytest
-import httpx
 import json
+from contextlib import nullcontext
+
+import httpx
+import pytest
+from structlog.testing import capture_logs
 from trans import (
-    TransApiClient, 
-    TransAuthClient, 
+    TransApiClient,
+    TransAuthClient,
     TransBulkCancelPublicationResponse,
-    TransSdkConfig, 
-    TransApiError, 
+    TransSdkConfig,
+    TransApiError,
     TransAuthRejectedError,
     TransApiUnreachableError,
     TransFreightExchangeRequest,
-    TransFreightExchangeResponse
+    bind_observability_context,
 )
 
 @pytest.fixture
@@ -21,6 +24,26 @@ def config():
         client_secret="test_secret",
     )
 
+
+def test_bind_observability_context_includes_correlation_fields() -> None:
+    with capture_logs() as logs:
+        with bind_observability_context(request_id="req-123", operation_id="op-456"):
+            from trans.observability import log_sdk_event
+
+            log_sdk_event(
+                "sdk.trans.http",
+                operation="publish_freight_offer",
+                method="POST",
+                url="https://api.test/freights",
+                status_code=201,
+                duration_ms=12.5,
+            )
+
+    assert logs[0]["request_id"] == "req-123"
+    assert logs[0]["operation_id"] == "op-456"
+    assert logs[0]["kind"] == "sdk_event"
+    assert logs[0]["sdk"] == "trans"
+
 @pytest.mark.asyncio
 async def test_api_client_error_handling(config):
     def handler(request):
@@ -28,11 +51,16 @@ async def test_api_client_error_handling(config):
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         api_client = TransApiClient(config=config, client=client)
-        with pytest.raises(TransApiError) as excinfo:
-            await api_client._execute_request("GET", "test")
+        with capture_logs() as logs:
+            with pytest.raises(TransApiError) as excinfo:
+                await api_client._execute_request("test_request", "GET", "test")
         
         assert excinfo.value.normalized.status_code == 400
         assert excinfo.value.normalized.detail == "Test error"
+        assert logs[0]["operation"] == "test_request"
+        assert logs[0]["kind"] == "sdk_event"
+        assert logs[0]["status_code"] == 400
+        assert logs[0]["error"]["retryable"] is False
 
 @pytest.mark.asyncio
 async def test_auth_client_url_build(config):
@@ -136,7 +164,7 @@ async def test_api_client_429_retry_after(config):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         api_client = TransApiClient(config=config, client=client)
         with pytest.raises(TransApiError) as excinfo:
-            await api_client._execute_request("GET", "test")
+            await api_client._execute_request("test_request", "GET", "test")
         
         assert excinfo.value.normalized.status_code == 429
         assert excinfo.value.normalized.retry_after_seconds == 10.0
@@ -149,7 +177,7 @@ async def test_api_client_500_error(config):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         api_client = TransApiClient(config=config, client=client)
         with pytest.raises(TransApiError) as excinfo:
-            await api_client._execute_request("GET", "test")
+            await api_client._execute_request("test_request", "GET", "test")
         
         assert excinfo.value.normalized.status_code == 500
 
@@ -161,7 +189,7 @@ async def test_api_client_network_failure(config):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         api_client = TransApiClient(config=config, client=client)
         with pytest.raises(TransApiUnreachableError):
-            await api_client._execute_request("GET", "test")
+            await api_client._execute_request("test_request", "GET", "test")
 
 @pytest.mark.asyncio
 async def test_api_client_refresh_cancel(config):

@@ -4,7 +4,6 @@ import asyncio
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
-import logging
 import random
 import re
 import threading
@@ -21,12 +20,11 @@ from .dtos import (    TransFreightExchangeRequest,
 )
 from .config import TransSdkConfig
 from .exceptions import TransApiError, TransApiUnreachableError, TransInvalidResponseError
+from .observability import log_sdk_event
 
 _RAW_PREVIEW_MAX_LEN = 1200
 _RAW_TEXT_REDACTION_SCAN_MAX = _RAW_PREVIEW_MAX_LEN * 4
 _VALIDATION_SUMMARY_LIMIT = 5
-
-logger = logging.getLogger("trans.api")
 
 
 @dataclass(frozen=True)
@@ -60,6 +58,7 @@ class TransApiClient:
 
     async def _execute_request(
         self,
+        operation: str,
         method: str,
         path: str,
         *,
@@ -68,9 +67,6 @@ class TransApiClient:
         timeout: float | None = None,
     ) -> httpx.Response:
         url = f"{self._config.api_base_url.rstrip('/')}/{path.lstrip('/')}"
-        
-        
-
         start_time = time.monotonic()
         try:
             resp = await self._client.request(
@@ -81,22 +77,54 @@ class TransApiClient:
                 timeout=timeout or self._config.timeout_seconds,
             )
             elapsed_ms = (time.monotonic() - start_time) * 1000
-            
-            _log_interaction(
-                method=method,
-                url=url,
-                request_body=request_body,
-                resp=resp,
-                elapsed_ms=elapsed_ms,
-            )
-            
             if resp.status_code >= 400:
                 normalized = _normalize_trans_error(resp)
+                log_sdk_event(
+                    "sdk.trans.http",
+                    operation=operation,
+                    method=method,
+                    url=url,
+                    status_code=resp.status_code,
+                    duration_ms=elapsed_ms,
+                    retry_after_seconds=normalized.retry_after_seconds,
+                    provider_request_id=normalized.provider_response_id
+                    or _provider_request_id(resp),
+                    request_body=_redact_json_value(request_body) if request_body else None,
+                    response_headers=_safe_response_headers(resp),
+                    response_body=_safe_response_body(resp),
+                    error={
+                        "type": "provider_error",
+                        "retryable": _is_retryable_status(resp.status_code),
+                        "detail": normalized.detail,
+                        "title": normalized.title,
+                    },
+                )
                 raise TransApiError(normalized)
-                
+
+            log_sdk_event(
+                "sdk.trans.http",
+                operation=operation,
+                method=method,
+                url=url,
+                status_code=resp.status_code,
+                duration_ms=elapsed_ms,
+                provider_request_id=_provider_request_id(resp),
+                request_body=_redact_json_value(request_body) if request_body else None,
+                response_headers=_safe_response_headers(resp),
+                response_body=_safe_response_body(resp),
+            )
             return resp
-            
         except httpx.RequestError as exc:
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            log_sdk_event(
+                "sdk.trans.http",
+                operation=operation,
+                method=method,
+                url=url,
+                duration_ms=elapsed_ms,
+                request_body=_redact_json_value(request_body) if request_body else None,
+                error={"type": type(exc).__name__, "retryable": True, "detail": str(exc)},
+            )
             raise TransApiUnreachableError(str(exc)) from exc
 
     async def new_freight_to_freight_exchange(
@@ -114,6 +142,7 @@ class TransApiClient:
         }
         body = payload.model_dump(by_alias=True, exclude_none=True)
         resp = await self._execute_request(
+            operation="publish_freight_offer",
             method="POST",
             path=path,
             headers=headers,
@@ -143,6 +172,7 @@ class TransApiClient:
             "Api-key": self._config.api_key,
         }
         await self._execute_request(
+            operation="refresh_freight_publication",
             method="PUT",
             path=path,
             headers=headers,
@@ -160,6 +190,7 @@ class TransApiClient:
             "Api-key": self._config.api_key,
         }
         await self._execute_request(
+            operation="cancel_freight_publication",
             method="POST",
             path=path,
             headers=headers,
@@ -176,6 +207,7 @@ class TransApiClient:
             "Api-key": self._config.api_key,
         }
         resp = await self._execute_request(
+            operation="bulk_cancel_freight_publications",
             method="POST",
             path=path,
             headers=headers,
@@ -188,65 +220,41 @@ class TransApiClient:
             raise TransInvalidResponseError("Trans API invalid JSON response") from exc
         return TransBulkCancelPublicationResponse.model_validate(parsed)
 
+def _provider_request_id(resp: httpx.Response) -> str | None:
+    for key in ("x-request-id", "request-id", "x-correlation-id"):
+        value = resp.headers.get(key)
+        if value:
+            return value
+    return None
 
 
-
-def _log_interaction(
-    *,
-    method: str,
-    url: str,
-    request_body: dict | None,
-    resp: httpx.Response,
-    elapsed_ms: float,
-) -> None:
-    safe_body = _redact_json_value(request_body) if request_body else None
-
-    safe_response: Any = None
-    try:
-        response_body = resp.json()
-        safe_response = (
-            _redact_json_value(response_body)
-            if isinstance(response_body, (dict, list))
-            else response_body
-        )
-    except Exception:
-        raw_text = resp.text or ""
-        if raw_text:
-            safe_response = _truncate(
-                _redact_text(_compact_single_line(raw_text)),
-                max_len=_RAW_PREVIEW_MAX_LEN,
-            )
-
-    data = {
-        "method": method,
-        "url": url,
-        "request_body": safe_body,
-        "status_code": resp.status_code,
-        "response_headers": dict(resp.headers),
-        "response_body": safe_response,
-        "elapsed_ms": round(elapsed_ms, 1),
+def _safe_response_headers(resp: httpx.Response) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in resp.headers.items()
+        if key.lower() not in {"authorization", "set-cookie"}
     }
 
-    log_message = "Trans API %s %s -> %s (%.0fms)"
-    if resp.status_code >= 400:
-        logger.error(
-            log_message,
-            method,
-            url,
-            resp.status_code,
-            elapsed_ms,
-            extra={"trans_interaction": data},
-        )
-        return
 
-    logger.info(
-        log_message,
-        method,
-        url,
-        resp.status_code,
-        elapsed_ms,
-        extra={"trans_interaction": data},
-    )
+def _safe_response_body(resp: httpx.Response) -> Any:
+    try:
+        response_body = resp.json()
+    except Exception:
+        raw_text = resp.text or ""
+        if not raw_text:
+            return None
+        return _truncate(
+            _redact_text(_compact_single_line(raw_text)),
+            max_len=_RAW_PREVIEW_MAX_LEN,
+        )
+
+    if isinstance(response_body, (dict, list)):
+        return _redact_json_value(response_body)
+    return response_body
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code == 429 or status_code >= 500
 
 
 def _extract_trans_error(resp: httpx.Response) -> str:

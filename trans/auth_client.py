@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
-import logging
 import re
 import time
 from typing import Any
@@ -14,8 +13,8 @@ from pydantic import SecretStr
 from .dtos import TransErrorResponse, TransTokenResponse
 from .config import TransSdkConfig
 from .exceptions import TransAuthError, TransAuthRejectedError, TransApiUnreachableError, TransInvalidResponseError
+from .observability import log_sdk_event
 
-logger = logging.getLogger("trans.auth")
 _RAW_PREVIEW_MAX_LEN = 1200
 
 
@@ -96,7 +95,7 @@ class TransAuthClient:
             "client_id": self._config.client_id,
             "client_secret": self._config.client_secret,
         }
-        return await self._post_token(payload)
+        return await self._post_token(payload, operation="exchange_code_for_token")
 
     async def _refresh_access_token(self, refresh_token: str) -> TransTokenResponse:
         payload = {
@@ -105,9 +104,9 @@ class TransAuthClient:
             "client_id": self._config.client_id,
             "client_secret": self._config.client_secret,
         }
-        return await self._post_token(payload)
+        return await self._post_token(payload, operation="refresh_access_token")
 
-    async def _post_token(self, payload: dict[str, str]) -> TransTokenResponse:
+    async def _post_token(self, payload: dict[str, str], *, operation: str) -> TransTokenResponse:
         # OAuth authorize UI lives on auth host, but token exchange is served
         # under the API host `/ext/auth-api/accounts/token`.
         url = f"{self._config.api_base_url.rstrip('/')}/ext/auth-api/accounts/token"
@@ -129,17 +128,14 @@ class TransAuthClient:
                     resp = await client.post(url, data=payload, headers=headers, timeout=30.0)
         except httpx.RequestError as exc:
             elapsed_ms = (time.monotonic() - t0) * 1000
-            logger.error(
-                "Trans auth token request failed",
-                extra={
-                    "trans_auth_interaction": {
-                        "method": "POST",
-                        "url": url,
-                        "request_body": safe_payload,
-                        "elapsed_ms": round(elapsed_ms, 1),
-                        "error": str(exc),
-                    }
-                },
+            log_sdk_event(
+                "sdk.trans.auth",
+                operation=operation,
+                method="POST",
+                url=url,
+                duration_ms=elapsed_ms,
+                request_body=safe_payload,
+                error={"type": type(exc).__name__, "retryable": True, "detail": str(exc)},
             )
             raise TransApiUnreachableError("Trans API unreachable") from exc
 
@@ -160,35 +156,31 @@ class TransAuthClient:
         elif isinstance(response_payload, str):
             safe_response = _redact_token_like_text(response_payload)[:_RAW_PREVIEW_MAX_LEN]
 
-        log_data = {
-            "method": "POST",
-            "url": url,
-            "request_body": safe_payload,
-            "status_code": resp.status_code,
-            "response_headers": dict(resp.headers),
-            "response_body": safe_response,
-            "elapsed_ms": round(elapsed_ms, 1),
-        }
-        log_message = "Trans auth POST %s -> %s (%.0fms)"
+        error_detail = None
         if resp.status_code >= 400:
-            logger.error(
-                log_message,
-                url,
-                resp.status_code,
-                elapsed_ms,
-                extra={"trans_auth_interaction": log_data},
-            )
-        else:
-            logger.info(
-                log_message,
-                url,
-                resp.status_code,
-                elapsed_ms,
-                extra={"trans_auth_interaction": log_data},
-            )
+            error_detail = self._error_detail(raw) or f"Trans API error ({resp.status_code})"
+
+        log_sdk_event(
+            "sdk.trans.auth",
+            operation=operation,
+            method="POST",
+            url=url,
+            status_code=resp.status_code,
+            duration_ms=elapsed_ms,
+            request_body=safe_payload,
+            response_headers=_safe_response_headers(resp),
+            response_body=safe_response,
+            error=None
+            if resp.status_code < 400
+            else {
+                "type": "auth_error",
+                "retryable": resp.status_code >= 500,
+                "detail": error_detail,
+            },
+        )
 
         if resp.status_code >= 400:
-            detail = self._error_detail(raw) or f"Trans API error ({resp.status_code})"
+            detail = error_detail or f"Trans API error ({resp.status_code})"
             if resp.status_code == 401:
                 raise TransAuthRejectedError(detail)
 
@@ -228,3 +220,11 @@ class TransAuthClient:
         if error.error_description:
             return f"Trans API error: {error.error_description}"
         return f"Trans API error: {error.error}"
+
+
+def _safe_response_headers(resp: httpx.Response) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in resp.headers.items()
+        if key.lower() not in {"authorization", "set-cookie"}
+    }
