@@ -15,6 +15,13 @@ from trans import (
     TransFreightExchangeRequest,
     bind_observability_context,
 )
+from trans.dtos import (
+    TransPayment,
+    TransPaymentCurrency,
+    TransPaymentPeriod,
+    TransPaymentPeriodEnum,
+    TransPaymentPrice,
+)
 
 @pytest.fixture
 def config():
@@ -155,6 +162,70 @@ async def test_api_client_publish_success(config):
         )
         response = await api_client.new_freight_to_freight_exchange(payload, access_token="token")
         assert response.id == 123
+
+
+@pytest.mark.asyncio
+async def test_api_client_publish_nests_payment_period_under_price(config):
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["payment"] == {
+            "price": {
+                "value": 999.0,
+                "currency": "eur",
+                "period": {
+                    "payment": "deferred",
+                    "days": 21,
+                },
+            }
+        }
+        return httpx.Response(201, json={"id": 123, "status": "published"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        api_client = TransApiClient(config=config, client=client)
+        payload = TransFreightExchangeRequest(
+            capacity=24.0,
+            requirements={
+                "is_ftl": True,
+                "required_truck_bodies": ["truck"],
+            },
+            payment=TransPayment(
+                price=TransPaymentPrice(
+                    value=999.0,
+                    currency=TransPaymentCurrency.EUR,
+                    period=TransPaymentPeriod(
+                        payment=TransPaymentPeriodEnum.DEFERRED,
+                        days=21,
+                    ),
+                ),
+            ),
+            publish=True,
+            spots=[
+                {
+                    "spot_order": 1,
+                    "place": {
+                        "address": {
+                            "country": "pl",
+                            "locality": "Wroclaw",
+                            "postal_code": "50-001",
+                        }
+                    },
+                    "operations": [
+                        {
+                            "operation_order": 1,
+                            "type": "loading",
+                            "timespans": {
+                                "begin": "2026-03-20T10:00:00Z",
+                                "end": "2026-03-20T12:00:00Z",
+                            },
+                        }
+                    ],
+                }
+            ],
+        )
+
+        response = await api_client.new_freight_to_freight_exchange(payload, access_token="token")
+
+    assert response.id == 123
 
 @pytest.mark.asyncio
 async def test_api_client_429_retry_after(config):

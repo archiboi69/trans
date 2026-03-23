@@ -260,11 +260,11 @@ class TransPaymentPeriod(TransBaseModel):
 class TransPaymentPrice(TransBaseModel):
     value: float | None = None
     currency: TransPaymentCurrency | None = None
+    period: TransPaymentPeriod | None = None
 
 
 class TransPayment(TransBaseModel):
     price: TransPaymentPrice | None = None
-    period: TransPaymentPeriod | None = None
 
 
 class TransAddress(TransBaseModel):
