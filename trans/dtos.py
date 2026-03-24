@@ -233,7 +233,7 @@ class TransTemperature(TransBaseModel):
 
 
 class TransRequirements(TransBaseModel):
-    """OpenAPI spec misspells "monitoring" as "monitorig"."""
+    """Monitoring requirement for this freight."""
 
     transport: TransTransport | None = None
     vehicle_size: TransVehicleSizeEnum | None = None
@@ -246,8 +246,7 @@ class TransRequirements(TransBaseModel):
     required_tipper_trailer_additional_equipment: (
         list[TransRequiredTipperTrailerAdditionalEquipment] | None
     ) = None
-    # Intentionally misspelled to match the Trans payload key.
-    monitorig: TransMonitoringEnum | None = None
+    monitoring: TransMonitoringEnum | None = None
     temperature: TransTemperature | None = None
     shipping_remarks: str | None = None
 
