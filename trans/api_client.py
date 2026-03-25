@@ -19,7 +19,7 @@ from .dtos import (    TransFreightExchangeRequest,
     TransFreightExchangeResponse,
 )
 from .config import TransSdkConfig
-from .exceptions import TransApiError, TransApiUnreachableError, TransInvalidResponseError
+from .exceptions import TransApiError, TransApiUnreachableError, TransInvalidResponseError, format_network_error
 from .observability import log_sdk_event
 
 _RAW_PREVIEW_MAX_LEN = 1200
@@ -117,17 +117,7 @@ class TransApiClient:
         except httpx.RequestError as exc:
             elapsed_ms = (time.monotonic() - start_time) * 1000
             
-            exc_type = type(exc).__name__
-            exc_str = str(exc).strip()
-            exc_repr = repr(exc)
-            
-            error_message = exc_str if exc_str else exc_type
-            
-            error_category = "transport_error"
-            if isinstance(exc, httpx.TimeoutException):
-                error_category = "timeout"
-            elif isinstance(exc, httpx.ConnectError):
-                error_category = "connection_error"
+            error_message, error_dict = format_network_error(exc)
                 
             log_sdk_event(
                 "sdk.trans.http",
@@ -136,13 +126,7 @@ class TransApiClient:
                 url=url,
                 duration_ms=elapsed_ms,
                 request_body=_redact_json_value(request_body) if request_body else None,
-                error={
-                    "type": exc_type,
-                    "category": error_category,
-                    "retryable": True,
-                    "detail": error_message,
-                    "repr": exc_repr,
-                },
+                error=error_dict,
             )
             raise TransApiUnreachableError(error_message) from exc
 

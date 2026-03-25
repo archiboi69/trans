@@ -1,7 +1,33 @@
 from typing import Any, TYPE_CHECKING
 
+import httpx
+
 if TYPE_CHECKING:
     from .api_client import TransNormalizedError
+
+def format_network_error(exc: Exception) -> tuple[str, dict[str, Any]]:
+    """Format an exception into a human-readable message and a structured dictionary."""
+    exc_type = type(exc).__name__
+    exc_str = str(exc).strip()
+    exc_repr = repr(exc)
+    
+    error_message = exc_str if exc_str else exc_type
+    
+    error_category = "transport_error"
+    if isinstance(exc, httpx.TimeoutException):
+        error_category = "timeout"
+    elif isinstance(exc, httpx.ConnectError):
+        error_category = "connection_error"
+        
+    error_dict = {
+        "type": exc_type,
+        "category": error_category,
+        "retryable": True,
+        "detail": error_message,
+        "repr": exc_repr,
+    }
+    
+    return error_message, error_dict
 
 class TransSdkError(Exception):
     """Base class for all Trans SDK errors."""
