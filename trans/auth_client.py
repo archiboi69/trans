@@ -128,6 +128,19 @@ class TransAuthClient:
                     resp = await client.post(url, data=payload, headers=headers, timeout=30.0)
         except httpx.RequestError as exc:
             elapsed_ms = (time.monotonic() - t0) * 1000
+            
+            exc_type = type(exc).__name__
+            exc_str = str(exc).strip()
+            exc_repr = repr(exc)
+            
+            error_message = exc_str if exc_str else exc_type
+            
+            error_category = "transport_error"
+            if isinstance(exc, httpx.TimeoutException):
+                error_category = "timeout"
+            elif isinstance(exc, httpx.ConnectError):
+                error_category = "connection_error"
+                
             log_sdk_event(
                 "sdk.trans.auth",
                 operation=operation,
@@ -135,9 +148,15 @@ class TransAuthClient:
                 url=url,
                 duration_ms=elapsed_ms,
                 request_body=safe_payload,
-                error={"type": type(exc).__name__, "retryable": True, "detail": str(exc)},
+                error={
+                    "type": exc_type,
+                    "category": error_category,
+                    "retryable": True,
+                    "detail": error_message,
+                    "repr": exc_repr,
+                },
             )
-            raise TransApiUnreachableError("Trans API unreachable") from exc
+            raise TransApiUnreachableError(error_message) from exc
 
         raw = resp.text
         elapsed_ms = (time.monotonic() - t0) * 1000

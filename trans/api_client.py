@@ -116,6 +116,19 @@ class TransApiClient:
             return resp
         except httpx.RequestError as exc:
             elapsed_ms = (time.monotonic() - start_time) * 1000
+            
+            exc_type = type(exc).__name__
+            exc_str = str(exc).strip()
+            exc_repr = repr(exc)
+            
+            error_message = exc_str if exc_str else exc_type
+            
+            error_category = "transport_error"
+            if isinstance(exc, httpx.TimeoutException):
+                error_category = "timeout"
+            elif isinstance(exc, httpx.ConnectError):
+                error_category = "connection_error"
+                
             log_sdk_event(
                 "sdk.trans.http",
                 operation=operation,
@@ -123,9 +136,15 @@ class TransApiClient:
                 url=url,
                 duration_ms=elapsed_ms,
                 request_body=_redact_json_value(request_body) if request_body else None,
-                error={"type": type(exc).__name__, "retryable": True, "detail": str(exc)},
+                error={
+                    "type": exc_type,
+                    "category": error_category,
+                    "retryable": True,
+                    "detail": error_message,
+                    "repr": exc_repr,
+                },
             )
-            raise TransApiUnreachableError(str(exc)) from exc
+            raise TransApiUnreachableError(error_message) from exc
 
     async def new_freight_to_freight_exchange(
         self,
